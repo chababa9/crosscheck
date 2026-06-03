@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest'
 import {
   buildFixAppliedCommentBody,
   buildConflictResolvedCommentBody,
+  buildRetriedReviewBanner,
+  buildReviewTimeoutFailedCommentBody,
 } from '../lib/comment-bodies.js'
 
 describe('buildFixAppliedCommentBody', () => {
@@ -80,5 +82,50 @@ describe('buildConflictResolvedCommentBody', () => {
     })
     expect(body).not.toContain('...and')
     expect(body).not.toContain('more_')
+  })
+})
+
+describe('buildRetriedReviewBanner', () => {
+  it('renders rounded seconds for the timeout and the retry delay', () => {
+    const banner = buildRetriedReviewBanner(180_000, 120_000)
+    expect(banner).toContain('⏱ **Retried**')
+    expect(banner).toContain('timed out at 180s')
+    expect(banner).toContain('120s wait')
+    expect(banner.startsWith('> ')).toBe(true)
+  })
+
+  it('rounds sub-second precision', () => {
+    expect(buildRetriedReviewBanner(1_500, 2_400)).toContain('timed out at 2s')
+  })
+
+  it('points the reader at the timeout_sec knob for repeat occurrences', () => {
+    const banner = buildRetriedReviewBanner(180_000, 120_000)
+    expect(banner).toContain('`timeout_sec`')
+  })
+})
+
+describe('buildReviewTimeoutFailedCommentBody', () => {
+  it('states the timeout and retry delay, gives a re-run hint, and uses a non-review marker', () => {
+    const body = buildReviewTimeoutFailedCommentBody({
+      prUrl: 'https://github.com/o/r/pull/7',
+      timeoutSec: 180,
+      retryDelaySec: 120,
+    })
+    expect(body).toContain('Review failed — timed out')
+    expect(body).toContain('**180s**')
+    expect(body).toContain('120s wait')
+    expect(body).toContain('crosscheck run https://github.com/o/r/pull/7')
+    // Distinct from a review annotation so Phase 1 detection ignores it.
+    expect(body).toContain('<!-- crosscheck: review_failed -->')
+    expect(body).not.toContain('origin=')
+  })
+
+  it('mentions the timeout_sec config knob as the action item', () => {
+    const body = buildReviewTimeoutFailedCommentBody({
+      prUrl: 'https://github.com/o/r/pull/7',
+      timeoutSec: 600,
+      retryDelaySec: 120,
+    })
+    expect(body).toContain('timeout_sec')
   })
 })
