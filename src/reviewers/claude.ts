@@ -3,6 +3,7 @@ import type { QualityConfig, VendorConfig } from '../config/schema.js'
 import { DEFAULT_REVIEW_INSTRUCTIONS } from '../lib/workflow.js'
 import { resolveClaudeModel } from '../lib/review-models.js'
 import { withTimeoutRetry } from '../lib/with-timeout-retry.js'
+import { tierTimeoutMs } from './tier-timeouts.js'
 
 const EFFORT_MAP: Record<string, string> = {
   low: 'low',
@@ -76,8 +77,8 @@ export async function runClaudeReview(
 
   onLog?.(`  running: claude --print --model ${model} --effort ${effort}`)
 
-  // timeoutMs: 0 → no cap (crazy/halfcrazy); undefined → 180s default; positive → user-specified
-  const resolvedTimeout = timeoutMs === undefined ? 180_000 : timeoutMs === 0 ? undefined : timeoutMs
+  // timeoutMs: 0 → no cap (crazy/halfcrazy); undefined → tier-based default (300/600/1200s); positive → user-specified
+  const resolvedTimeout = timeoutMs === undefined ? tierTimeoutMs(quality.tier) : timeoutMs === 0 ? undefined : timeoutMs
 
   try {
     const { result: { stdout }, retried } = await withTimeoutRetry(
