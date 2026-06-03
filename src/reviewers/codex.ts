@@ -108,8 +108,9 @@ export async function runCodexReview(
     const execa = err as { stdout?: string; stderr?: string; message?: string; exitCode?: number; timedOut?: boolean; effectiveTimeoutMs?: number; retryDelayMs?: number }
     const rawStderr = execa.stderr ?? ''
     const effectiveMs = execa.effectiveTimeoutMs ?? resolvedTimeout
+    const retryNote = execa.retryDelayMs !== undefined ? ' (retried once)' : ''
     const summary = execa.timedOut
-      ? `timed out after ${effectiveMs !== undefined ? effectiveMs / 1000 : '?'}s (retried once) — PR diff may be too large (tier: ${quality.tier})`
+      ? `timed out after ${effectiveMs !== undefined ? effectiveMs / 1000 : '?'}s${retryNote} — PR diff may be too large (tier: ${quality.tier})`
       : (extractErrorSummary(rawStderr) ?? execa.message ?? 'unknown error')
     const thrown = Object.assign(new Error(`codex: ${summary}`), {
       exitCode: execa.exitCode,

@@ -19,7 +19,7 @@ import { buildCommitTrailers } from '../lib/annotation.js'
 import { resolveClaudeModel, resolveCodexModel } from '../lib/review-models.js'
 import { buildStepIdentityFields } from '../lib/event-fields.js'
 import { buildFixAppliedCommentBody, buildConflictResolvedCommentBody, buildRetriedReviewBanner, buildReviewTimeoutFailedCommentBody } from '../lib/comment-bodies.js'
-import { isTimeoutError } from '../lib/with-timeout-retry.js'
+import { isTimeoutError, DEFAULT_RETRY_DELAY_MS } from '../lib/with-timeout-retry.js'
 import { loadWorkflow, evaluateWhen, type StepResult } from '../lib/workflow.js'
 import type { PRPhase } from '../lib/board.js'
 import { isSubscriptionLimitError } from '../lib/smart-switch.js'
@@ -530,8 +530,14 @@ export async function runWorkflow(ctx: WorkflowContext): Promise<WorkflowResult>
         if (!isTimeoutError(err)) throw err
         reviewTimedOut = true
         const errAny = err as { effectiveTimeoutMs?: number; retryDelayMs?: number }
-        const timeoutSec = errAny.effectiveTimeoutMs !== undefined ? Math.round(errAny.effectiveTimeoutMs / 1000) : 0
-        const retryDelaySec = errAny.retryDelayMs !== undefined ? Math.round(errAny.retryDelayMs / 1000) : 0
+        // Fall back to the configured cap for the active reviewer if the helper
+        // didn't tag the error. By contract that path is unreachable, but rendering
+        // "0s" in a PR comment would be misleading if the contract ever loosens.
+        const fallbackTimeoutMs = ctx.overrideTimeoutMs
+          ?? vendorTimeoutMs(reviewer === 'codex' ? config.vendors.codex.timeout_sec : config.vendors.claude.timeout_sec)
+          ?? 0
+        const timeoutSec = Math.round((errAny.effectiveTimeoutMs ?? fallbackTimeoutMs) / 1000)
+        const retryDelaySec = Math.round((errAny.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS) / 1000)
         fileLog({ level: 'warn', event: 'review_timeout_failed', repo: `${owner}/${repoName}`, pr: prNumber, reviewer, ...stepIdentity, effective_timeout_sec: timeoutSec, retry_delay_sec: retryDelaySec, ...(ctx.round !== undefined && { round: ctx.round }), ...triggerField })
         if (!ctx.dryRun) {
           try {
