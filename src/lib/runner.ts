@@ -18,7 +18,8 @@ import { log as fileLog, logError } from '../lib/logger.js'
 import { buildCommitTrailers } from '../lib/annotation.js'
 import { resolveClaudeModel, resolveCodexModel } from '../lib/review-models.js'
 import { buildStepIdentityFields } from '../lib/event-fields.js'
-import { buildFixAppliedCommentBody, buildConflictResolvedCommentBody } from '../lib/comment-bodies.js'
+import { buildFixAppliedCommentBody, buildConflictResolvedCommentBody, buildRetriedReviewBanner, buildReviewTimeoutFailedCommentBody } from '../lib/comment-bodies.js'
+import { isTimeoutError } from '../lib/with-timeout-retry.js'
 import { loadWorkflow, evaluateWhen, type StepResult } from '../lib/workflow.js'
 import type { PRPhase } from '../lib/board.js'
 import { isSubscriptionLimitError } from '../lib/smart-switch.js'
@@ -480,52 +481,95 @@ export async function runWorkflow(ctx: WorkflowContext): Promise<WorkflowResult>
       let inputTokens: number | undefined
       let outputTokens: number | undefined
       let model = 'default'
+      let retried: { timeoutMs: number; delayMs: number } | undefined
       const runReviewWithVendor = async (candidate: Vendor): Promise<void> => {
         if (candidate === 'codex') {
-          ;({ review: rawReview, tokensUsed, model } = await runCodexReview(tmpDir, pr.base.ref, pr.title, config.quality, config.vendors.codex, step.instructions, undefined, ctx.overrideTimeoutMs ?? vendorTimeoutMs(config.vendors.codex.timeout_sec)))
+          ;({ review: rawReview, tokensUsed, model, retried } = await runCodexReview(tmpDir, pr.base.ref, pr.title, config.quality, config.vendors.codex, step.instructions, log, ctx.overrideTimeoutMs ?? vendorTimeoutMs(config.vendors.codex.timeout_sec)))
           inputTokens = undefined
           outputTokens = undefined
         } else {
-          ;({ review: rawReview, tokensUsed, inputTokens, outputTokens, model } = await runClaudeReview(tmpDir, pr.base.ref, pr.title, config.quality, config.vendors.claude, config.budget.per_review_usd, step.instructions, undefined, ctx.overrideTimeoutMs ?? vendorTimeoutMs(config.vendors.claude.timeout_sec), !!ctx.roundMode))
+          ;({ review: rawReview, tokensUsed, inputTokens, outputTokens, model, retried } = await runClaudeReview(tmpDir, pr.base.ref, pr.title, config.quality, config.vendors.claude, config.budget.per_review_usd, step.instructions, log, ctx.overrideTimeoutMs ?? vendorTimeoutMs(config.vendors.claude.timeout_sec), !!ctx.roundMode))
         }
       }
 
+      let reviewTimedOut = false
       try {
-        await runReviewWithVendor(reviewer)
+        try {
+          await runReviewWithVendor(reviewer)
+        } catch (err: unknown) {
+          if (!isSubscriptionLimitError(err)) throw err
+
+          const failedVendor = reviewer
+          const fallbackVendor = resolveLimitFallbackVendor(failedVendor, effectiveType, config)
+          const reason = err instanceof Error ? err.message : String(err)
+          ctx.onVendorLimit?.(failedVendor, fallbackVendor, reason, step.name)
+
+          if (!fallbackVendor) throw err
+
+          fileLog({
+            level: 'warn',
+            event: 'vendor_fallback',
+            repo: `${owner}/${repoName}`,
+            pr: prNumber,
+            step: step.name,
+            step_type: effectiveType,
+            failed_vendor: failedVendor,
+            fallback_vendor: fallbackVendor,
+            reason: reason.slice(0, 300),
+          })
+          log(chalk.yellow(`⚠  ${failedVendor} hit a usage limit — switching ${effectiveType} step to ${fallbackVendor}`))
+          reviewer = fallbackVendor
+          onPhaseChange(`${reviewer} ${isRecheck ? 'rechecking' : 'reviewing'}...`, { phase: startPhase })
+          await runReviewWithVendor(reviewer)
+        }
       } catch (err: unknown) {
-        if (!isSubscriptionLimitError(err)) throw err
+        // Both the first attempt and the delayed retry timed out. Surface the
+        // reason on the PR (otherwise the operator only sees a log line) and
+        // end this step gracefully — the workflow is still marked failed so
+        // pending review statuses are released as failure.
+        if (!isTimeoutError(err)) throw err
+        reviewTimedOut = true
+        const errAny = err as { effectiveTimeoutMs?: number; retryDelayMs?: number }
+        const timeoutSec = errAny.effectiveTimeoutMs !== undefined ? Math.round(errAny.effectiveTimeoutMs / 1000) : 0
+        const retryDelaySec = errAny.retryDelayMs !== undefined ? Math.round(errAny.retryDelayMs / 1000) : 0
+        fileLog({ level: 'warn', event: 'review_timeout_failed', repo: `${owner}/${repoName}`, pr: prNumber, reviewer, ...stepIdentity, effective_timeout_sec: timeoutSec, retry_delay_sec: retryDelaySec, ...(ctx.round !== undefined && { round: ctx.round }), ...triggerField })
+        if (!ctx.dryRun) {
+          try {
+            const octokit = createGithubClient(token)
+            await octokit.rest.issues.createComment({
+              owner, repo: repoName, issue_number: prNumber,
+              body: buildReviewTimeoutFailedCommentBody({ prUrl: pr.html_url, timeoutSec, retryDelaySec }),
+            })
+            fileLog({ level: 'info', event: 'review_timeout_comment_posted', repo: `${owner}/${repoName}`, pr: prNumber })
+          } catch (postErr) {
+            fileLog({ level: 'warn', event: 'review_timeout_comment_failed', repo: `${owner}/${repoName}`, pr: prNumber, error: postErr instanceof Error ? postErr.message : String(postErr) })
+          }
+        }
+      }
 
-        const failedVendor = reviewer
-        const fallbackVendor = resolveLimitFallbackVendor(failedVendor, effectiveType, config)
-        const reason = err instanceof Error ? err.message : String(err)
-        ctx.onVendorLimit?.(failedVendor, fallbackVendor, reason, step.name)
+      if (reviewTimedOut) {
+        workflowFailed = true
+        onPhaseChange('review timed out', { phase: donePhase })
+        results[step.name] = { skipped: true }
+        continue
+      }
 
-        if (!fallbackVendor) throw err
-
-        fileLog({
-          level: 'warn',
-          event: 'vendor_fallback',
-          repo: `${owner}/${repoName}`,
-          pr: prNumber,
-          step: step.name,
-          step_type: effectiveType,
-          failed_vendor: failedVendor,
-          fallback_vendor: fallbackVendor,
-          reason: reason.slice(0, 300),
-        })
-        log(chalk.yellow(`⚠  ${failedVendor} hit a usage limit — switching ${effectiveType} step to ${fallbackVendor}`))
-        reviewer = fallbackVendor
-        onPhaseChange(`${reviewer} ${isRecheck ? 'rechecking' : 'reviewing'}...`, { phase: startPhase })
-        await runReviewWithVendor(reviewer)
+      // First attempt timed out but the delayed retry succeeded — surface a
+      // soft notice on the review comment so the author knows it was a transient blip.
+      if (retried) {
+        fileLog({ level: 'info', event: 'review_retried', repo: `${owner}/${repoName}`, pr: prNumber, reviewer, ...stepIdentity, retry_timeout_sec: Math.round(retried.timeoutMs / 1000), retry_delay_sec: Math.round(retried.delayMs / 1000), ...(ctx.round !== undefined && { round: ctx.round }), ...triggerField })
       }
 
       const { verdict, clean } = parseVerdict(rawReview)
       if (verdict === null) {
         fileLog({ level: 'warn', event: 'verdict_parse_failed', repo: `${owner}/${repoName}`, pr: prNumber, reviewer, ...stepIdentity, output_length: rawReview.length })
       }
-      const commentBody = verdict === null
+      const baseBody = verdict === null
         ? `${NULL_VERDICT_WARNING}\n\n${clean}`
         : prependVerdictToComment(clean, verdict)
+      const commentBody = retried
+        ? `${buildRetriedReviewBanner(retried.timeoutMs, retried.delayMs)}\n\n${baseBody}`
+        : baseBody
       const commentCount = countComments(rawReview)
       fileLog({ level: 'info', event: 'review_complete', repo: `${owner}/${repoName}`, pr: prNumber, reviewer, model, ...stepIdentity, verdict, duration_ms: Date.now() - stepStart, tokens_used: tokensUsed, ...(inputTokens !== undefined && { input_tokens: inputTokens }), ...(outputTokens !== undefined && { output_tokens: outputTokens }), ...(ctx.round !== undefined && { round: ctx.round }), ...(ctx.roundMode && { mode: ctx.roundMode }), ...triggerField })
 
